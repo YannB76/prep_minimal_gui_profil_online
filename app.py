@@ -1,5 +1,6 @@
-# app.py — Chess Prep (Streamlit)
+# app.py — Chess Prep (Streamlit) avec session_state persistant
 # Lancer en local : streamlit run app.py
+
 import io, os, re, math, time
 import datetime as dt
 from typing import List, Tuple, Dict, Optional
@@ -14,6 +15,11 @@ import requests
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Chess Prep", layout="wide")
+
+# état persistant : résultats d’analyse
+if "prep_results" not in st.session_state:
+    st.session_state["prep_results"] = None
+
 HTTP_HEADERS = {"User-Agent": "chess-prep-web/1.0"}
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -358,7 +364,87 @@ def fetch_chesscom_pgn(username: str,
     return "\n\n".join(out_pgns)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UI
+# RENDU PERSISTANT DES RÉSULTATS (session_state)
+# ──────────────────────────────────────────────────────────────────────────────
+def render_prep_results():
+    r = st.session_state.get("prep_results")
+    if not r:
+        return
+
+    st.subheader("Ouvertures à cibler")
+    st.dataframe(r["mo"].head(50), use_container_width=True)
+
+    st.subheader("Lignes courtes à cibler")
+    st.dataframe(r["ml"].head(50), use_container_width=True)
+
+    st.markdown("### ✅ Recommandation unique")
+    st.write(f"**{r['eco']} — {r['opening_name']}**")
+    st.write(f"Avantage (score_gap): **{r['score_gap']} pts** • Volumes (adv/moi): {r['games_opp']} / {r['games_me']}")
+    if r.get("short_line"):
+        st.write(f"Ligne courte: `{r['short_line']}`")
+    if r.get("pv"):
+        st.write(f"Ligne poussée (~20 demi-coups): `{r['pv']}`")
+    else:
+        st.info("Pas trouvé de ligne poussée dans tes propres PGN pour cette ouverture.")
+
+    st.download_button(
+        "📥 Télécharger le PGN de la reco",
+        r["pgn_text"].encode("utf-8"),
+        file_name="recommendation.pgn",
+        mime="application/x-chess-pgn",
+        key="dl_reco"
+    )
+
+    with st.expander("Envoyer vers une étude Lichess (optionnel)"):
+        def _get_secret(name: str, default: str = ""):
+            try:
+                val = st.secrets.get(name)
+                if val:
+                    return str(val)
+            except Exception:
+                pass
+            return os.environ.get(name, default)
+
+        token_input = st.text_input(
+            "Token API Lichess (secret)",
+            type="password",
+            placeholder="colle le token ici si tu ne l’as pas mis dans les Secrets",
+            key="tok"
+        )
+        study_input = st.text_input("Study ID (optionnel)", placeholder="ex: yfCjZd8R", key="stud")
+
+        if st.button("Envoyer", key="send_lichess"):
+            try:
+                token = token_input or _get_secret("LICHESS_TOKEN", "")
+                study_id = study_input or _get_secret("LICHESS_STUDY_ID", "")
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+                if token and study_id:
+                    resp = requests.post(
+                        f"https://lichess.org/api/study/{study_id}/import-pgn",
+                        headers=headers,
+                        data={"pgn": r["pgn_text"], "chapterName": f"Prépa – {r['eco']} {r['opening_name']}"},
+                        timeout=30
+                    )
+                    resp.raise_for_status()
+                    st.success("Importé dans l’étude. Ouvre Lichess pour voir le nouveau chapitre.")
+                else:
+                    resp = requests.post("https://lichess.org/api/import", data={"pgn": r["pgn_text"]}, timeout=30)
+                    resp.raise_for_status()
+                    url = resp.json().get("url")
+                    st.success(f"Partie importée : {url}")
+                    st.markdown(f"[Ouvrir sur Lichess]({url})")
+            except Exception as e:
+                st.error(f"Échec envoi Lichess : {e}")
+
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("🧹 Effacer l’analyse"):
+            st.session_state["prep_results"] = None
+            st.experimental_rerun()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UI PRINCIPALE
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("Préparation d’adversaire (Web)")
 
@@ -425,9 +511,12 @@ with tab_an:
     who_white = st.radio("Couleurs du match", ["P1 a les Blancs", "P2 a les Blancs"], index=0, horizontal=True)
     preparing = st.radio("Qui se prépare ?", ["P1","P2"], index=0, horizontal=True)
 
-    run = st.button("Lancer l'analyse")
+    # Formulaire pour éviter les reruns pendant la saisie
+    with st.form("prep_form"):
+        submitted = st.form_submit_button("Lancer l'analyse")
 
-    if run:
+    # Si on clique, on calcule et on stocke TOUT dans session_state
+    if submitted:
         # Charger les 4 PGN selon le mode choisi
         if mode == "Upload fichiers":
             if not all([p1w, p1b, p2w, p2b]):
@@ -528,11 +617,6 @@ with tab_an:
         if autotune and len(ml)<target_lines:
             mo, ml, eff, tuned = autotune_lines_to_target(opp_open, me_open, opp_line, me_line, params, int(target_lines))
 
-        st.subheader("Ouvertures à cibler")
-        st.dataframe(mo.head(50), use_container_width=True)
-        st.subheader("Lignes courtes à cibler")
-        st.dataframe(ml.head(50), use_container_width=True)
-
         # Recommandation unique
         reco_opening, reco_line = pick_unique_reco(
             mo, ml,
@@ -541,28 +625,17 @@ with tab_an:
             min_opp_games_reco=int(min_opp_reco)
         )
 
-        if not reco_opening:
-            st.warning("Pas de reco trouvée avec ces filtres.")
-        else:
+        eco = opening_name = short_line = pv = None
+        pgn_text = ""
+        if reco_opening:
             eco = reco_opening.get("eco","")
             opening_name = reco_opening.get("opening","")
             short_line = (reco_line or {}).get("line")
-
             pv_line, deep_games, deep_score = find_deep_line(
                 me_pgn_for_deep, me_side, eco, opening_name, prefix_line=short_line, deep_plies=20
             )
             pv = san_to_pgn_numbered(pv_line) if pv_line else None
 
-            st.markdown("### ✅ Recommandation unique")
-            st.write(f"**{eco} — {opening_name}**")
-            st.write(f"Avantage (score_gap): **{reco_opening.get('score_gap')} pts** • Volumes (adv/moi): {reco_opening.get('games_opp')} / {reco_opening.get('games_me')}")
-            if short_line: st.write(f"Ligne courte: `{short_line}`")
-            if pv:
-                st.write(f"Ligne poussée (~20 demi-coups): `{pv}`")
-            else:
-                st.info("Pas trouvé de ligne poussée dans tes propres PGN pour cette ouverture.")
-
-            # PGN à télécharger
             pgn_text = f"""[Event "Préparation web"]
 [Site "?"]
 [White "{white_name}"]
@@ -574,50 +647,28 @@ with tab_an:
 {pv if pv else '; indisponible'}
 *"""
 
-            st.download_button("📥 Télécharger le PGN de la reco",
-                               pgn_text.encode("utf-8"),
-                               file_name="recommendation.pgn",
-                               mime="application/x-chess-pgn")
+        # STOCKAGE persistant des résultats
+        st.session_state["prep_results"] = (
+            None if not reco_opening else {
+                "mo": mo, "ml": ml,
+                "eco": eco, "opening_name": opening_name,
+                "score_gap": float(reco_opening.get("score_gap", 0)),
+                "games_opp": int(reco_opening.get("games_opp", 0)),
+                "games_me": int(reco_opening.get("games_me", 0)),
+                "short_line": short_line,
+                "pv": pv,
+                "pgn_text": pgn_text,
+                "white_name": white_name,
+                "black_name": black_name,
+            }
+        )
+        if not reco_opening:
+            st.warning("Pas de reco trouvée avec ces filtres.")
+        else:
+            st.success("Analyse prête ✅ (les résultats restent affichés même après un clic).")
 
-            # Envoi vers Lichess — version nettoyée (pas de secret affiché)
-            def _get_secret(name: str, default: str = ""):
-                try:
-                    val = st.secrets.get(name)
-                    if val:
-                        return str(val)
-                except Exception:
-                    pass
-                return os.environ.get(name, default)
-
-            with st.expander("Envoyer vers une étude Lichess (optionnel)"):
-                token_input = st.text_input("Token API Lichess (secret)",
-                                            type="password",
-                                            placeholder="colle le token ici si tu ne l’as pas mis dans les Secrets")
-                study_input = st.text_input("Study ID (optionnel)", placeholder="ex: yfCjZd8R")
-
-                if st.button("Envoyer"):
-                    try:
-                        token = token_input or _get_secret("LICHESS_TOKEN", "")
-                        study_id = study_input or _get_secret("LICHESS_STUDY_ID", "")
-                        headers = {"Authorization": f"Bearer {token}"} if token else {}
-
-                        if token and study_id:
-                            r = requests.post(
-                                f"https://lichess.org/api/study/{study_id}/import-pgn",
-                                headers=headers,
-                                data={"pgn": pgn_text, "chapterName": f"Prépa – {eco} {opening_name}"},
-                                timeout=30
-                            )
-                            r.raise_for_status()
-                            st.success("Importé dans l’étude. Ouvre Lichess pour voir le nouveau chapitre.")
-                        else:
-                            r = requests.post("https://lichess.org/api/import", data={"pgn": pgn_text}, timeout=30)
-                            r.raise_for_status()
-                            url = r.json().get("url")
-                            st.success(f"Partie importée : {url}")
-                            st.markdown(f"[Ouvrir sur Lichess]({url})")
-                    except Exception as e:
-                        st.error(f"Échec envoi Lichess : {e}")
+    # RENDU : affiche les derniers résultats disponibles (même après un rerun)
+    render_prep_results()
 
 # ============================
 # Onglet 2 — Profils & Elo
